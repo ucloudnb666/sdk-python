@@ -13,7 +13,7 @@ import mistralai
 from pydantic import BaseModel
 from typing_extensions import TypedDict, Unpack, override
 
-from ..types.content import ContentBlock, Messages
+from ..types.content import ContentBlock, Messages, SystemContentBlock
 from ..types.exceptions import ModelThrottledException
 from ..types.streaming import StopReason, StreamEvent
 from ..types.tools import ToolChoice, ToolResult, ToolSpec, ToolUse
@@ -396,6 +396,57 @@ class MistralModel(Model):
 
         if hasattr(response, "usage") and response.usage:
             yield {"chunk_type": "metadata", "data": response.usage}
+
+    @override
+    async def _estimate_tokens(
+        self,
+        messages: Messages,
+        tool_specs: list[ToolSpec] | None = None,
+        system_prompt: str | None = None,
+        system_prompt_content: list[SystemContentBlock] | None = None,
+    ) -> int:
+        """Estimate token count using Mistral's native tokenize endpoint.
+
+        Formats the conversation using the same logic as chat requests and calls
+        the Mistral tokenization API to get an accurate token count.
+
+        Args:
+            messages: List of message objects to estimate tokens for.
+            tool_specs: List of tool specifications to include in the estimate.
+            system_prompt: Plain string system prompt. Ignored if system_prompt_content is provided.
+            system_prompt_content: Structured system prompt content blocks.
+
+        Returns:
+            Estimated total input tokens.
+        """
+        try:
+            effective_system_prompt = system_prompt
+            if system_prompt_content:
+                effective_system_prompt = " ".join(block["text"] for block in system_prompt_content if "text" in block)
+
+            request = self.format_request(messages, tool_specs, effective_system_prompt)
+
+            async with mistralai.Mistral(**self.client_args) as client:
+                response = await client.chat.tokenize_async(
+                    model=request["model"],
+                    messages=request["messages"],
+                    **({"tools": request["tools"]} if request.get("tools") else {}),
+                )
+                total_tokens: int = response.count
+
+            logger.debug(
+                "model_id=<%s>, total_tokens=<%d> | native token count",
+                self.config["model_id"],
+                total_tokens,
+            )
+            return total_tokens
+        except Exception as e:
+            logger.warning(
+                "model_id=<%s>, error=<%s> | native token counting failed, falling back to estimation",
+                self.config["model_id"],
+                e,
+            )
+            return await super()._estimate_tokens(messages, tool_specs, system_prompt, system_prompt_content)
 
     @override
     async def stream(

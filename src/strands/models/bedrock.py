@@ -746,6 +746,53 @@ class BedrockModel(Model):
         return events
 
     @override
+    async def _estimate_tokens(
+        self,
+        messages: Messages,
+        tool_specs: list[ToolSpec] | None = None,
+        system_prompt: str | None = None,
+        system_prompt_content: list[SystemContentBlock] | None = None,
+    ) -> int:
+        """Estimate token count using Bedrock's native CountTokens API.
+
+        Uses the same message format as the Converse API to get accurate token counts
+        directly from the Bedrock service.
+
+        Args:
+            messages: List of message objects to estimate tokens for.
+            tool_specs: List of tool specifications to include in the estimate.
+            system_prompt: Plain string system prompt. Ignored if system_prompt_content is provided.
+            system_prompt_content: Structured system prompt content blocks.
+
+        Returns:
+            Estimated total input tokens.
+        """
+        try:
+            if system_prompt and system_prompt_content is None:
+                system_prompt_content = [{"text": system_prompt}]
+
+            request = self._format_request(messages, tool_specs, system_prompt_content)
+            # Remove fields not accepted by count_tokens
+            request.pop("inferenceConfig", None)
+            request.pop("additionalModelRequestFields", None)
+            request.pop("additionalModelResponseFieldPaths", None)
+            request.pop("guardrailConfig", None)
+            request.pop("serviceTier", None)
+
+            response = await asyncio.to_thread(self.client.count_tokens, **request)
+            total_tokens: int = response["totalTokens"]
+
+            logger.debug("model_id=<%s>, total_tokens=<%d> | native token count", self.config["model_id"], total_tokens)
+            return total_tokens
+        except Exception as e:
+            logger.warning(
+                "model_id=<%s>, error=<%s> | native token counting failed, falling back to estimation",
+                self.config["model_id"],
+                e,
+            )
+            return await super()._estimate_tokens(messages, tool_specs, system_prompt, system_prompt_content)
+
+    @override
     async def stream(
         self,
         messages: Messages,

@@ -3045,3 +3045,105 @@ async def test_non_streaming_citations_with_only_location(bedrock_client, model,
     assert citation["location"] == {"web": {"url": "https://example.com", "domain": "example.com"}}
     assert "title" not in citation
     assert "sourceContent" not in citation
+
+
+class TestEstimateTokens:
+    """Tests for BedrockModel._estimate_tokens native token counting."""
+
+    @pytest.fixture
+    def model_with_client(self, bedrock_client, model_id):
+        _ = bedrock_client
+        return BedrockModel(model_id=model_id)
+
+    @pytest.fixture
+    def messages(self):
+        return [{"role": "user", "content": [{"text": "hello"}]}]
+
+    @pytest.fixture
+    def tool_specs(self):
+        return [
+            {
+                "name": "test_tool",
+                "description": "A test tool",
+                "inputSchema": {"json": {"type": "object", "properties": {}}},
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_native_token_count_success(self, model_with_client, bedrock_client, messages):
+        """Native count_tokens API returns accurate token count."""
+        bedrock_client.count_tokens.return_value = {"totalTokens": 42}
+
+        result = await model_with_client._estimate_tokens(messages=messages)
+
+        assert result == 42
+        bedrock_client.count_tokens.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_native_token_count_with_system_prompt(self, model_with_client, bedrock_client, messages):
+        """System prompt is converted to system_prompt_content for count_tokens."""
+        bedrock_client.count_tokens.return_value = {"totalTokens": 55}
+
+        result = await model_with_client._estimate_tokens(messages=messages, system_prompt="Be helpful.")
+
+        assert result == 55
+        call_kwargs = bedrock_client.count_tokens.call_args[1]
+        assert call_kwargs["system"] == [{"text": "Be helpful."}]
+
+    @pytest.mark.asyncio
+    async def test_native_token_count_with_tool_specs(self, model_with_client, bedrock_client, messages, tool_specs):
+        """Tool specs are included in the count_tokens request."""
+        bedrock_client.count_tokens.return_value = {"totalTokens": 100}
+
+        result = await model_with_client._estimate_tokens(messages=messages, tool_specs=tool_specs)
+
+        assert result == 100
+        call_kwargs = bedrock_client.count_tokens.call_args[1]
+        assert "toolConfig" in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_native_token_count_strips_inference_config(self, model_with_client, bedrock_client, messages):
+        """inferenceConfig and other non-counting fields are stripped from the request."""
+        bedrock_client.count_tokens.return_value = {"totalTokens": 10}
+        model_with_client.update_config(max_tokens=100)
+
+        await model_with_client._estimate_tokens(messages=messages)
+
+        call_kwargs = bedrock_client.count_tokens.call_args[1]
+        assert "inferenceConfig" not in call_kwargs
+        assert "additionalModelRequestFields" not in call_kwargs
+        assert "guardrailConfig" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_fallback_on_api_error(self, model_with_client, bedrock_client, messages):
+        """Falls back to base estimation when native API fails."""
+        bedrock_client.count_tokens.side_effect = ClientError(
+            {"Error": {"Code": "ValidationException", "Message": "Unsupported"}},
+            "CountTokens",
+        )
+
+        result = await model_with_client._estimate_tokens(messages=messages)
+
+        # Should still return a value from the fallback
+        assert isinstance(result, int)
+        assert result >= 0
+
+    @pytest.mark.asyncio
+    async def test_fallback_on_generic_exception(self, model_with_client, bedrock_client, messages):
+        """Falls back to base estimation on any exception."""
+        bedrock_client.count_tokens.side_effect = RuntimeError("Connection failed")
+
+        result = await model_with_client._estimate_tokens(messages=messages)
+
+        assert isinstance(result, int)
+        assert result >= 0
+
+    @pytest.mark.asyncio
+    async def test_fallback_logs_warning(self, model_with_client, bedrock_client, messages, caplog):
+        """A warning is logged when falling back to estimation."""
+        bedrock_client.count_tokens.side_effect = RuntimeError("API down")
+
+        with caplog.at_level(logging.WARNING):
+            await model_with_client._estimate_tokens(messages=messages)
+
+        assert any("native token counting failed" in record.message for record in caplog.records)

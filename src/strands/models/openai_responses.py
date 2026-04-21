@@ -54,7 +54,7 @@ except Exception as e:
 import openai  # noqa: E402 - must import after version check
 
 from ..types.citations import WebLocationDict  # noqa: E402
-from ..types.content import ContentBlock, Messages, Role  # noqa: E402
+from ..types.content import ContentBlock, Messages, Role, SystemContentBlock  # noqa: E402
 from ..types.exceptions import ContextWindowOverflowException, ModelThrottledException  # noqa: E402
 from ..types.streaming import StreamEvent  # noqa: E402
 from ..types.tools import ToolChoice, ToolResult, ToolSpec, ToolUse  # noqa: E402
@@ -183,6 +183,57 @@ class OpenAIResponsesModel(Model):
             The OpenAI Responses API model configuration.
         """
         return cast(OpenAIResponsesModel.OpenAIResponsesConfig, self.config)
+
+    @override
+    async def _estimate_tokens(
+        self,
+        messages: Messages,
+        tool_specs: list[ToolSpec] | None = None,
+        system_prompt: str | None = None,
+        system_prompt_content: list[SystemContentBlock] | None = None,
+    ) -> int:
+        """Estimate token count using the OpenAI Responses API input_tokens.count endpoint.
+
+        Uses the same message format as the Responses API to get accurate token counts
+        directly from the OpenAI service.
+
+        Args:
+            messages: List of message objects to estimate tokens for.
+            tool_specs: List of tool specifications to include in the estimate.
+            system_prompt: Plain string system prompt. Ignored if system_prompt_content is provided.
+            system_prompt_content: Structured system prompt content blocks.
+
+        Returns:
+            Estimated total input tokens.
+        """
+        try:
+            effective_system_prompt = system_prompt
+            if system_prompt_content:
+                effective_system_prompt = " ".join(block["text"] for block in system_prompt_content if "text" in block)
+
+            request = self._format_request(messages, tool_specs, effective_system_prompt)
+            # Remove fields not relevant for token counting
+            request.pop("stream", None)
+            request.pop("store", None)
+            request.pop("previous_response_id", None)
+
+            async with openai.AsyncOpenAI(**self.client_args) as client:
+                response = await client.responses.input_tokens.count(**request)
+                total_tokens: int = response.input_tokens
+
+            logger.debug(
+                "model_id=<%s>, total_tokens=<%d> | native token count",
+                self.config["model_id"],
+                total_tokens,
+            )
+            return total_tokens
+        except Exception as e:
+            logger.warning(
+                "model_id=<%s>, error=<%s> | native token counting failed, falling back to estimation",
+                self.config["model_id"],
+                e,
+            )
+            return await super()._estimate_tokens(messages, tool_specs, system_prompt, system_prompt_content)
 
     @override
     async def stream(

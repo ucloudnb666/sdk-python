@@ -679,3 +679,116 @@ def test_format_request_filters_location_source_document(model, caplog):
     user_content = formatted_messages[0]["content"]
     assert user_content == "analyze this document"
     assert "Location sources are not supported by Mistral" in caplog.text
+
+
+class TestEstimateTokens:
+    """Tests for MistralModel._estimate_tokens native token counting."""
+
+    @pytest.fixture
+    def mistral_client(self):
+        with unittest.mock.patch.object(strands.models.mistral.mistralai, "Mistral") as mock_client_cls:
+            mock_client = unittest.mock.AsyncMock()
+            mock_client_cls.return_value.__aenter__.return_value = mock_client
+            yield mock_client
+
+    @pytest.fixture
+    def model(self):
+        return MistralModel(model_id="mistral-large-latest")
+
+    @pytest.fixture
+    def messages(self):
+        return [{"role": "user", "content": [{"text": "hello"}]}]
+
+    @pytest.fixture
+    def tool_specs(self):
+        return [
+            {
+                "name": "test_tool",
+                "description": "A test tool",
+                "inputSchema": {"json": {"type": "object", "properties": {}}},
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_native_token_count_success(self, model, mistral_client, messages):
+        """Native tokenize endpoint returns accurate token count."""
+        mock_response = unittest.mock.AsyncMock()
+        mock_response.count = 42
+        mistral_client.chat.tokenize_async.return_value = mock_response
+
+        result = await model._estimate_tokens(messages=messages)
+
+        assert result == 42
+        mistral_client.chat.tokenize_async.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_native_token_count_with_system_prompt(self, model, mistral_client, messages):
+        """System prompt is included in the tokenize request as a system message."""
+        mock_response = unittest.mock.AsyncMock()
+        mock_response.count = 55
+        mistral_client.chat.tokenize_async.return_value = mock_response
+
+        result = await model._estimate_tokens(messages=messages, system_prompt="Be helpful.")
+
+        assert result == 55
+        call_kwargs = mistral_client.chat.tokenize_async.call_args[1]
+        # System prompt becomes first message
+        assert call_kwargs["messages"][0]["role"] == "system"
+        assert call_kwargs["messages"][0]["content"] == "Be helpful."
+
+    @pytest.mark.asyncio
+    async def test_native_token_count_with_tool_specs(self, model, mistral_client, messages, tool_specs):
+        """Tool specs are included in the tokenize request."""
+        mock_response = unittest.mock.AsyncMock()
+        mock_response.count = 100
+        mistral_client.chat.tokenize_async.return_value = mock_response
+
+        result = await model._estimate_tokens(messages=messages, tool_specs=tool_specs)
+
+        assert result == 100
+        call_kwargs = mistral_client.chat.tokenize_async.call_args[1]
+        assert "tools" in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_native_token_count_with_system_prompt_content(self, model, mistral_client, messages):
+        """System prompt content blocks are joined into a string."""
+        mock_response = unittest.mock.AsyncMock()
+        mock_response.count = 60
+        mistral_client.chat.tokenize_async.return_value = mock_response
+
+        result = await model._estimate_tokens(
+            messages=messages,
+            system_prompt_content=[{"text": "Be helpful."}, {"text": "Be concise."}],
+        )
+
+        assert result == 60
+
+    @pytest.mark.asyncio
+    async def test_fallback_on_api_error(self, model, mistral_client, messages):
+        """Falls back to base estimation when native API fails."""
+        mistral_client.chat.tokenize_async.side_effect = RuntimeError("Unsupported")
+
+        result = await model._estimate_tokens(messages=messages)
+
+        assert isinstance(result, int)
+        assert result >= 0
+
+    @pytest.mark.asyncio
+    async def test_fallback_on_generic_exception(self, model, mistral_client, messages):
+        """Falls back to base estimation on any exception."""
+        mistral_client.chat.tokenize_async.side_effect = RuntimeError("Connection failed")
+
+        result = await model._estimate_tokens(messages=messages)
+
+        assert isinstance(result, int)
+        assert result >= 0
+
+    @pytest.mark.asyncio
+    async def test_fallback_logs_warning(self, model, mistral_client, messages, caplog):
+        """A warning is logged when falling back to estimation."""
+        mistral_client.chat.tokenize_async.side_effect = RuntimeError("API down")
+
+        with caplog.at_level(logging.WARNING):
+            await model._estimate_tokens(messages=messages)
+
+        assert any("native token counting failed" in record.message for record in caplog.records)

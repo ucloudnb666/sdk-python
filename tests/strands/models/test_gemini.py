@@ -1096,3 +1096,113 @@ def test_format_request_filters_location_source_document(model, caplog):
     assert len(formatted_content) == 1
     assert "text" in formatted_content[0]
     assert "Location sources are not supported by Gemini" in caplog.text
+
+
+class TestEstimateTokens:
+    """Tests for GeminiModel._estimate_tokens native token counting."""
+
+    @pytest.fixture
+    def gemini_client(self):
+        with unittest.mock.patch.object(strands.models.gemini.genai, "Client") as mock_client_cls:
+            mock_client = mock_client_cls.return_value
+            mock_client.aio = unittest.mock.AsyncMock()
+            yield mock_client
+
+    @pytest.fixture
+    def model(self, gemini_client):
+        _ = gemini_client
+        return GeminiModel(model_id="m1")
+
+    @pytest.fixture
+    def messages(self):
+        return [{"role": "user", "content": [{"text": "hello"}]}]
+
+    @pytest.fixture
+    def tool_specs(self):
+        return [
+            {
+                "name": "test_tool",
+                "description": "A test tool",
+                "inputSchema": {"json": {"type": "object", "properties": {}}},
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_native_token_count_success(self, model, gemini_client, messages):
+        """Native count_tokens API returns accurate token count."""
+        mock_response = unittest.mock.AsyncMock()
+        mock_response.total_tokens = 42
+        gemini_client.aio.models.count_tokens.return_value = mock_response
+
+        result = await model._estimate_tokens(messages=messages)
+
+        assert result == 42
+        gemini_client.aio.models.count_tokens.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_native_token_count_with_system_prompt(self, model, gemini_client, messages):
+        """System prompt is included in the count_tokens config."""
+        mock_response = unittest.mock.AsyncMock()
+        mock_response.total_tokens = 55
+        gemini_client.aio.models.count_tokens.return_value = mock_response
+
+        result = await model._estimate_tokens(messages=messages, system_prompt="Be helpful.")
+
+        assert result == 55
+        call_kwargs = gemini_client.aio.models.count_tokens.call_args[1]
+        assert call_kwargs["config"].system_instruction == "Be helpful."
+
+    @pytest.mark.asyncio
+    async def test_native_token_count_with_tool_specs(self, model, gemini_client, messages, tool_specs):
+        """Tool specs are included in the count_tokens request."""
+        mock_response = unittest.mock.AsyncMock()
+        mock_response.total_tokens = 100
+        gemini_client.aio.models.count_tokens.return_value = mock_response
+
+        result = await model._estimate_tokens(messages=messages, tool_specs=tool_specs)
+
+        assert result == 100
+
+    @pytest.mark.asyncio
+    async def test_native_token_count_with_system_prompt_content(self, model, gemini_client, messages):
+        """System prompt content blocks are joined into a string for count_tokens."""
+        mock_response = unittest.mock.AsyncMock()
+        mock_response.total_tokens = 60
+        gemini_client.aio.models.count_tokens.return_value = mock_response
+
+        result = await model._estimate_tokens(
+            messages=messages,
+            system_prompt_content=[{"text": "Be helpful."}, {"text": "Be concise."}],
+        )
+
+        assert result == 60
+
+    @pytest.mark.asyncio
+    async def test_fallback_on_api_error(self, model, gemini_client, messages):
+        """Falls back to base estimation when native API fails."""
+        gemini_client.aio.models.count_tokens.side_effect = genai.errors.ClientError("Unsupported", response_json={})
+
+        result = await model._estimate_tokens(messages=messages)
+
+        assert isinstance(result, int)
+        assert result >= 0
+
+    @pytest.mark.asyncio
+    async def test_fallback_on_generic_exception(self, model, gemini_client, messages):
+        """Falls back to base estimation on any exception."""
+        gemini_client.aio.models.count_tokens.side_effect = RuntimeError("Connection failed")
+
+        result = await model._estimate_tokens(messages=messages)
+
+        assert isinstance(result, int)
+        assert result >= 0
+
+    @pytest.mark.asyncio
+    async def test_fallback_logs_warning(self, model, gemini_client, messages, caplog):
+        """A warning is logged when falling back to estimation."""
+        gemini_client.aio.models.count_tokens.side_effect = RuntimeError("API down")
+
+        with caplog.at_level(logging.WARNING):
+            await model._estimate_tokens(messages=messages)
+
+        assert any("native token counting failed" in record.message for record in caplog.records)

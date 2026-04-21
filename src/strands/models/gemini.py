@@ -15,7 +15,7 @@ import pydantic
 from google import genai
 from typing_extensions import Required, Unpack, override
 
-from ..types.content import ContentBlock, ContentBlockStartToolUse, Messages
+from ..types.content import ContentBlock, ContentBlockStartToolUse, Messages, SystemContentBlock
 from ..types.exceptions import ContextWindowOverflowException, ModelThrottledException
 from ..types.streaming import StreamEvent
 from ..types.tools import ToolChoice, ToolSpec
@@ -433,6 +433,61 @@ class GeminiModel(Model):
 
             case _:  # pragma: no cover
                 raise RuntimeError(f"chunk_type=<{event['chunk_type']} | unknown type")
+
+    @override
+    async def _estimate_tokens(
+        self,
+        messages: Messages,
+        tool_specs: list[ToolSpec] | None = None,
+        system_prompt: str | None = None,
+        system_prompt_content: list[SystemContentBlock] | None = None,
+    ) -> int:
+        """Estimate token count using Gemini's native count_tokens API.
+
+        Uses the same content and tool format as the generate_content API to get accurate
+        token counts directly from the Gemini service.
+
+        Args:
+            messages: List of message objects to estimate tokens for.
+            tool_specs: List of tool specifications to include in the estimate.
+            system_prompt: Plain string system prompt. Ignored if system_prompt_content is provided.
+            system_prompt_content: Structured system prompt content blocks.
+
+        Returns:
+            Estimated total input tokens.
+        """
+        try:
+            effective_system_prompt = system_prompt
+            if system_prompt_content:
+                effective_system_prompt = " ".join(block["text"] for block in system_prompt_content if "text" in block)
+
+            contents = self._format_request_content(messages)
+            count_config = genai.types.CountTokensConfig(
+                system_instruction=effective_system_prompt,
+                tools=self._format_request_tools(tool_specs),
+            )
+
+            client = self._get_client().aio
+            response = await client.models.count_tokens(
+                model=self.config["model_id"],
+                contents=contents,  # type: ignore[arg-type]
+                config=count_config,
+            )
+            total_tokens = response.total_tokens or 0
+
+            logger.debug(
+                "model_id=<%s>, total_tokens=<%d> | native token count",
+                self.config["model_id"],
+                total_tokens,
+            )
+            return total_tokens
+        except Exception as e:
+            logger.warning(
+                "model_id=<%s>, error=<%s> | native token counting failed, falling back to estimation",
+                self.config["model_id"],
+                e,
+            )
+            return await super()._estimate_tokens(messages, tool_specs, system_prompt, system_prompt_content)
 
     async def stream(
         self,
